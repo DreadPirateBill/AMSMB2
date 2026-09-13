@@ -33,7 +33,7 @@ public final class SMB2ReadStream: @unchecked Sendable {
         var position = offset
         while position < end {
             let chunk = Int(min(Int64(max(file.optimizedReadSize, 1)), end - position))
-            let data = try file.pread(offset: UInt64(position), length: chunk)
+            let data = try file.read(toAbsoluteOffset: UInt64(position), length: chunk)
             guard !data.isEmpty else { break }
             out.append(data)
             position += Int64(data.count)
