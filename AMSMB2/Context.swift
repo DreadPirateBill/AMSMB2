@@ -22,11 +22,17 @@ extension FileDescriptor {
 
 /// Provides synchronous operation on SMB2
 final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchecked Sendable {
+    /// libsmb2 registers every context in a process-wide linked list (`active_contexts` in lib/init.c) that `smb2_init_context` and
+    /// `smb2_destroy_context` mutate with no locking of their own. Two clients created or destroyed on different threads at once corrupt that list —
+    /// a dangling next pointer (EXC_BAD_ACCESS) or a wait that never returns. Every create and destroy in this file goes through this lock.
+    /// (Sprocket Player fork; the list is otherwise only read by libsmb2's server-side `smb2_serve_port`, which a client never calls.)
+    private static let contextRegistryLock = NSLock()
+
     var context: UnsafeMutablePointer<smb2_context>?
     private var _context_lock = NSRecursiveLock()
     
     init() throws {
-        self.context = try smb2_init_context().unwrap()
+        self.context = try Self.contextRegistryLock.withLock { try smb2_init_context().unwrap() }
     }
 
     deinit {
@@ -36,7 +42,7 @@ final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchec
         }
         try? withThreadSafeContext { context in
             self.context = nil
-            smb2_destroy_context(context)
+            Self.contextRegistryLock.withLock { smb2_destroy_context(context) }
         }
     }
 
@@ -240,7 +246,7 @@ extension SMB2Client {
     func service(revents: Int32) throws {
         let result = smb2_service(context, revents)
         if result < 0 {
-            smb2_destroy_context(context)
+            Self.contextRegistryLock.withLock { smb2_destroy_context(context) }
             context = nil
             try POSIXError.throwIfError(result, description: errorString)
         }

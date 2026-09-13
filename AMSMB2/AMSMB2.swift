@@ -31,6 +31,20 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     fileprivate var client: SMB2Client?
 
+    /// One connection per share this manager has visited, keyed by share name. `connectShare` switches `client` between them instead of tearing the
+    /// previous one down — switching shares used to destroy and recreate the connection every time. (Sprocket Player fork.)
+    fileprivate var cachedClients: [String: SMB2Client] = [:]
+
+    /// Connections are torn down here, never on the thread that happens to drop the last reference: `SMB2Client.deinit` does a network logoff and a
+    /// registry-locked destroy, both blocking. Serial, so teardowns never overlap either. (Sprocket Player fork.)
+    fileprivate static let teardownQueue = DispatchQueue(label: "AMSMB2.teardown", qos: .utility)
+
+    /// Hands a client to the teardown queue; the closure holds the last strong reference, so its deinit runs there.
+    fileprivate static func retire(_ client: SMB2Client?) {
+        guard let client else { return }
+        teardownQueue.async { _ = client }
+    }
+
     /// SMB2 Share URL.
     public let url: URL
 
@@ -170,6 +184,13 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         super.init()
     }
 
+    deinit {
+        let all = Array(cachedClients.values) + (client.map { [$0] } ?? [])
+        cachedClients.removeAll()
+        client = nil
+        for c in all { Self.retire(c) }
+    }
+
     open func encode(with aCoder: NSCoder) {
         aCoder.encode(url, forKey: CodingKeys.url.stringValue)
         aCoder.encode(_domain, forKey: CodingKeys.domain.stringValue)
@@ -244,9 +265,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         with(completionHandler: completionHandler) {
             self.connectLock.lock()
             defer { self.connectLock.unlock() }
-            if self.client == nil || !self.client.unsafelyUnwrapped.isActive
-                || self.client?.share != name
-            {
+            if let current = self.client, current.isActive, current.share == name {
+                // already on this share
+            } else if let cached = self.cachedClients[name], cached.isActive {
+                self.client = cached
+            } else {
+                Self.retire(self.cachedClients.removeValue(forKey: name))
                 self.client = try self.connect(shareName: name, encrypted: encrypted)
             }
 
@@ -254,6 +278,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             do {
                 try self.client!.echo()
             } catch {
+                Self.retire(self.cachedClients.removeValue(forKey: name))
                 self.client = try self.connect(shareName: name, encrypted: encrypted)
             }
         }
@@ -298,6 +323,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                     self.operationLock.unlock()
                 }
                 try self.client?.disconnect()
+                if let share = self.client?.share { self.cachedClients[share] = nil }
+                Self.retire(self.client)
                 self.client = nil
                 completionHandler?(nil)
             } catch {
@@ -1438,12 +1465,13 @@ extension SMB2Manager {
         client.timeout = _timeout
     }
 
-    private func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
+    private func connect(shareName: String, encrypted: Bool, cache: Bool = true) throws -> SMB2Client {
         let client = try SMB2Client()
         self.client = client
         initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
         try client.connect(server: server, share: shareName, user: _user)
+        if cache { cachedClients[shareName] = client }
         return client
     }
 
@@ -1519,7 +1547,7 @@ extension SMB2Manager {
     ) {
         queue {
             do {
-                let client = try self.connect(shareName: shareName, encrypted: encrypted)
+                let client = try self.connect(shareName: shareName, encrypted: encrypted, cache: false)   // one-shot (IPC$ etc.); not kept
                 defer { try? client.disconnect() }
 
                 let result = try handler(client)
