@@ -1447,6 +1447,32 @@ extension SMB2Manager {
         return client
     }
 
+    /**
+     Opens a file for random-access reads and keeps it open until the returned stream is closed or released. Intended for a single reader thread
+     (a demuxer); give the stream a manager of its own rather than one shared with directory listings.
+
+     - Parameters:
+       - atPath: path of the file to open.
+       - completionHandler: receives the open stream, or the error.
+     */
+    public func openReadStream(
+        atPath path: String,
+        completionHandler: @Sendable @escaping (_ result: Result<SMB2ReadStream, any Error>) -> Void
+    ) {
+        with(completionHandler: completionHandler) { client in
+            let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+            let size = try Int64(file.fstat().smb2_size)
+            return SMB2ReadStream(file: file, size: size)
+        }
+    }
+
+    /// Async form of `openReadStream(atPath:completionHandler:)`.
+    public func openReadStream(atPath path: String) async throws -> SMB2ReadStream {
+        try await withCheckedThrowingContinuation { continuation in
+            openReadStream(atPath: path, completionHandler: asyncHandler(continuation))
+        }
+    }
+
     private func with(
         completionHandler: SimpleCompletionHandler, handler: @Sendable @escaping () throws -> Void
     ) {
